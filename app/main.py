@@ -49,6 +49,7 @@ class RunCreated(BaseModel):
     run_id: int
     status: str
     watermark_seq: int
+    revision_watermark_batch: int
     total_samples: int
     created_at: datetime
 
@@ -57,6 +58,7 @@ class RunStatus(BaseModel):
     run_id: int
     status: str
     watermark_seq: int
+    revision_watermark_batch: int
     total_samples: int
     done_samples: int
     created_at: datetime
@@ -96,13 +98,16 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Point-in-time Payment Feature Builder",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "Rebuilds the last-24h payment amount per sample exactly as knowable "
         "at prediction time, so late-arriving corrections never leak the "
         "future into training data. Upload payment-revision CSVs and "
         "prediction-sample CSVs, then create a training run and download the "
-        "feature dataset once the run is complete."
+        "feature dataset once the run is complete. Each run freezes its "
+        "revision scope at creation (only batches committed by then are "
+        "used), so mid-run backfills and restarts never change a run's "
+        "results; the next run picks the corrections up."
     ),
     lifespan=lifespan,
 )
@@ -172,7 +177,10 @@ _UPLOAD_OPENAPI_EXTRA = {
         "visible_at_utc,amount_cents,revoked`. Idempotent: a key "
         "(payment_id, revision_id) re-uploaded with identical content is "
         "reused; the same key with different content rejects the ENTIRE "
-        "batch (409, nothing stored). Send the CSV as raw body "
+        "batch (409, nothing stored). Batches are accepted at any time — "
+        "no need to wait for a training run to finish — but a batch "
+        "committed after a run was created is out of that run's scope and "
+        "only affects later runs. Send the CSV as raw body "
         "(`Content-Type: text/csv`) or as multipart file."
     ),
     openapi_extra=_UPLOAD_OPENAPI_EXTRA,
@@ -245,8 +253,12 @@ async def upload_sample_batch(request: Request):
     response_model=RunCreated,
     summary="Create a training run over all samples accepted so far",
     description=(
-        "Freezes the acceptance watermark: exactly the sample batches "
-        "committed before this call are included. Only one active "
+        "Freezes two acceptance watermarks: exactly the sample batches "
+        "(`watermark_seq`) and the payment-revision batches "
+        "(`revision_watermark_batch`) committed before this call are in "
+        "scope. Revision batches uploaded while the run is in progress — "
+        "even backdated ones visible at prediction time — belong to the "
+        "NEXT run and never change this run's results. Only one active "
         "(pending/running) run is allowed; 409 otherwise."
     ),
 )
@@ -267,18 +279,23 @@ def create_training_run(request: Request):
         watermark = conn.execute(
             "SELECT COALESCE(MAX(seq), 0) FROM samples"
         ).fetchone()[0]
+        revision_watermark = conn.execute(
+            "SELECT COALESCE(MAX(batch_id), 0) FROM revision_batches"
+        ).fetchone()[0]
         total = conn.execute(
             "SELECT count(*) FROM samples WHERE seq <= %s", (watermark,)
         ).fetchone()[0]
         row = conn.execute(
-            "INSERT INTO training_runs (watermark_seq, total_samples) "
-            "VALUES (%s, %s) RETURNING run_id, status, created_at",
-            (watermark, total),
+            "INSERT INTO training_runs "
+            "(watermark_seq, revision_watermark_batch, total_samples) "
+            "VALUES (%s, %s, %s) RETURNING run_id, status, created_at",
+            (watermark, revision_watermark, total),
         ).fetchone()
     return RunCreated(
         run_id=row[0],
         status=row[1],
         watermark_seq=watermark,
+        revision_watermark_batch=revision_watermark,
         total_samples=total,
         created_at=row[2],
     )
@@ -289,18 +306,19 @@ def _run_status_row(row) -> RunStatus:
         run_id=row[0],
         status=row[1],
         watermark_seq=row[2],
-        total_samples=row[3],
-        done_samples=row[4],
-        created_at=row[5],
-        started_at=row[6],
-        finished_at=row[7],
-        error=row[8],
+        revision_watermark_batch=row[3],
+        total_samples=row[4],
+        done_samples=row[5],
+        created_at=row[6],
+        started_at=row[7],
+        finished_at=row[8],
+        error=row[9],
     )
 
 
 _RUN_COLS = (
-    "run_id, status, watermark_seq, total_samples, done_samples, "
-    "created_at, started_at, finished_at, error"
+    "run_id, status, watermark_seq, revision_watermark_batch, "
+    "total_samples, done_samples, created_at, started_at, finished_at, error"
 )
 
 

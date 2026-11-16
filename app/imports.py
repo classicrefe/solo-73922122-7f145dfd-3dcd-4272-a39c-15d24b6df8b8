@@ -5,6 +5,9 @@ Rules implemented here:
   the existing row is reused, the upload stays idempotent.
 * Same key with different content -> the ENTIRE batch is rejected (the
   caller's transaction rolls back, nothing from the batch is stored).
+* Every imported revision row is stamped with the batch_id it arrived in;
+  a training run's revision scope is "all batches committed before the run
+  was created", i.e. ``batch_id <= run.revision_watermark_batch``.
 """
 
 from __future__ import annotations
@@ -16,10 +19,12 @@ from psycopg import Connection
 
 from .csvio import RevisionRow, SampleRow
 
-# Advisory lock key serializing "sample batch acceptance" against
-# "training run creation" so a run's watermark is an exact acceptance
-# instant: every batch committed before the lock is included, every batch
-# after it is not.
+# Advisory lock key serializing "batch acceptance" (sample AND revision)
+# against "training run creation" so a run's watermarks are exact
+# acceptance instants: every batch committed before the lock is included,
+# every batch after it is not. Because the lock is held for the whole
+# import transaction, identity-generated batch ids / sample seqs are
+# assigned in commit order and MAX(...) read under the same lock is exact.
 ACCEPTANCE_LOCK_KEY = 730001
 
 
@@ -45,8 +50,20 @@ def import_revision_batch(
     """Insert one revision batch. Returns (batch_id, inserted, reused).
 
     Must be called inside a transaction; raises ConflictError to roll the
-    whole batch back.
+    whole batch back. Takes the acceptance advisory lock so training-run
+    revision watermarks are exact: a batch is either entirely inside or
+    entirely outside any run's scope, and a run created after this batch
+    commits always includes it.
     """
+    conn.execute("SELECT pg_advisory_xact_lock(%s)", (ACCEPTANCE_LOCK_KEY,))
+    batch_id = conn.execute(
+        """
+        INSERT INTO revision_batches (rows_total, rows_inserted, rows_reused)
+        VALUES (%s, 0, 0)
+        RETURNING batch_id
+        """,
+        (len(rows) + in_file_dups,),
+    ).fetchone()[0]
     inserted = 0
     reused = in_file_dups
     conflicts: list[dict[str, Any]] = []
@@ -55,9 +72,10 @@ def import_revision_batch(
             """
             INSERT INTO payment_revisions
                 (payment_id, revision_id, account_id, occurred_at, visible_at,
-                 amount_cents, revoked)
+                 amount_cents, revoked, batch_id)
             VALUES (%(payment_id)s, %(revision_id)s, %(account_id)s,
-                    %(occurred_at)s, %(visible_at)s, %(amount_cents)s, %(revoked)s)
+                    %(occurred_at)s, %(visible_at)s, %(amount_cents)s,
+                    %(revoked)s, %(batch_id)s)
             ON CONFLICT (payment_id, revision_id) DO NOTHING
             RETURNING payment_id
             """,
@@ -69,11 +87,15 @@ def import_revision_batch(
                 "visible_at": r.visible_at,
                 "amount_cents": r.amount_cents,
                 "revoked": r.revoked,
+                "batch_id": batch_id,
             },
         ).fetchone()
         if got:
             inserted += 1
             continue
+        # Row already existed (same key). It keeps its ORIGINAL batch_id:
+        # idempotent re-uploads never move a row into a newer batch, so a
+        # re-upload cannot extend an old run's frozen scope.
         existing = conn.execute(
             """
             SELECT account_id, occurred_at, visible_at, amount_cents, revoked
@@ -108,14 +130,11 @@ def import_revision_batch(
             )
     if conflicts:
         raise ConflictError(conflicts)
-    batch_id = conn.execute(
-        """
-        INSERT INTO revision_batches (rows_total, rows_inserted, rows_reused)
-        VALUES (%s, %s, %s)
-        RETURNING batch_id
-        """,
-        (len(rows) + in_file_dups, inserted, reused),
-    ).fetchone()[0]
+    conn.execute(
+        "UPDATE revision_batches SET rows_inserted = %s, rows_reused = %s "
+        "WHERE batch_id = %s",
+        (inserted, reused, batch_id),
+    )
     return batch_id, inserted, reused
 
 

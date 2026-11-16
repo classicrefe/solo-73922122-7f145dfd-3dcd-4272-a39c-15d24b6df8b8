@@ -266,6 +266,131 @@ class E2E(unittest.TestCase):
             self.assertEqual(len({r["sample_id"] for r in rows}), total)  # no duplicates
             self.assertEqual(sum(r["sample_id"].startswith("rs-") for r in rows), 5000)
 
+    def test_06_revision_watermark_freezes_scope(self):
+        """Backdated revisions uploaded mid-run must not leak into that run.
+
+        Reproduces the reported defect: two samples with the same
+        (account_id, prediction_at) inside one run used to get different
+        amounts when a past-visible correction was uploaded between their
+        computations. Now the run's revision scope is frozen at creation.
+        """
+        base = REV_HEADER + (
+            "rw-q1,1,acct-RW,2026-11-15T11:00:00Z,2026-11-15T10:00:00Z,100,false\n"
+        )
+        # identical samples: same account, same prediction instant
+        smp = SMP_HEADER + "".join(
+            f"rw-s{i:04d},acct-RW,2026-11-15T12:00:00Z\n" for i in range(3000)
+        )
+        with TestClient(app) as client:
+            r = post_csv(client, "/payment-revision-batches", base)
+            self.assertEqual(r.status_code, 201, r.text)
+            base_batch = r.json()["batch_id"]
+            self.assertEqual(post_csv(client, "/sample-batches", smp).status_code, 201)
+            run = client.post("/training-runs").json()
+            run_id, total = run["run_id"], run["total_samples"]
+            # the run's revision scope is exactly the batches committed so far
+            self.assertEqual(run["revision_watermark_batch"], base_batch)
+            # wait until the run is genuinely in flight
+            deadline = time.time() + 60
+            done = 0
+            while time.time() < deadline:
+                body = client.get(f"/training-runs/{run_id}").json()
+                done = body["done_samples"]
+                if 0 < done < total:
+                    break
+                if body["status"] == "completed":
+                    self.fail("run finished before mid-run upload could be tested")
+                time.sleep(0.1)
+            self.assertGreater(done, 0)
+            self.assertLess(done, total)
+            # mid-run backfill: a correction AND a new payment, both with
+            # visible_at BEFORE the samples' prediction time. Accepted
+            # immediately (201) — uploads never wait for training.
+            late = REV_HEADER + (
+                "rw-q1,2,acct-RW,2026-11-15T11:00:00Z,2026-11-15T11:30:00Z,999,false\n"
+                "rw-q2,1,acct-RW,2026-11-15T11:00:00Z,2026-11-15T11:00:00Z,5,false\n"
+            )
+            r = post_csv(client, "/payment-revision-batches", late)
+            self.assertEqual(r.status_code, 201, r.text)
+            late_batch = r.json()["batch_id"]
+            final = wait_run(client, run_id)
+            self.assertEqual(final["status"], "completed")
+            rows = [r for r in dataset_rows(client, run_id)
+                    if r["sample_id"].startswith("rw-s")]
+            self.assertEqual(len(rows), 3000)
+            # every identical sample computed with the OLD scope: no mixture
+            self.assertEqual({r["amount_last_24h_cents"] for r in rows}, {"100"})
+            self.assertEqual({r["payment_count"] for r in rows}, {"1"})
+            # next run sees the backfilled batch (frozen scope moved)
+            run2 = client.post("/training-runs").json()
+            self.assertEqual(run2["revision_watermark_batch"], late_batch)
+            final2 = wait_run(client, run2["run_id"])
+            self.assertEqual(final2["status"], "completed")
+            rows2 = [r for r in dataset_rows(client, run2["run_id"])
+                     if r["sample_id"].startswith("rw-s")]
+            self.assertEqual(len(rows2), 3000)
+            # 999 (corrected rw-q1) + 5 (backfilled rw-q2) = 1004
+            self.assertEqual({r["amount_last_24h_cents"] for r in rows2}, {"1004"})
+            self.assertEqual({r["payment_count"] for r in rows2}, {"2"})
+            # the old run's dataset is immutable
+            rows1again = [r for r in dataset_rows(client, run_id)
+                          if r["sample_id"].startswith("rw-s")]
+            self.assertEqual({r["amount_last_24h_cents"] for r in rows1again}, {"100"})
+
+    def test_07_restart_keeps_revision_scope(self):
+        """A run resumed after restart uses its ORIGINAL revision scope.
+
+        Backfilled revisions uploaded while the service is down (or right
+        after it came back) must not change the remaining samples of the
+        in-flight run — restart must not mix calibers.
+        """
+        base = REV_HEADER + (
+            "rr-q1,1,acct-RR,2026-11-15T11:00:00Z,2026-11-15T10:00:00Z,7,false\n"
+        )
+        smp = SMP_HEADER + "".join(
+            f"rr-{i:05d},acct-RR,2026-11-15T12:00:00Z\n" for i in range(4000)
+        )
+        with TestClient(app) as client:
+            self.assertEqual(post_csv(client, "/payment-revision-batches", base).status_code, 201)
+            self.assertEqual(post_csv(client, "/sample-batches", smp).status_code, 201)
+            run = client.post("/training-runs").json()
+            run_id, total = run["run_id"], run["total_samples"]
+            deadline = time.time() + 60
+            done = 0
+            while time.time() < deadline:
+                body = client.get(f"/training-runs/{run_id}").json()
+                done = body["done_samples"]
+                if 0 < done < total:
+                    break
+                if body["status"] == "completed":
+                    self.fail("run finished before restart could be tested")
+                time.sleep(0.1)
+            self.assertGreater(done, 0)
+            self.assertLess(done, total)
+        # graceful shutdown mid-run; run is handed back as 'pending'
+        with TestClient(app) as client2:
+            # backdated correction lands while the resumed run is active
+            late = REV_HEADER + (
+                "rr-q1,2,acct-RR,2026-11-15T11:00:00Z,2026-11-15T11:30:00Z,77,false\n"
+            )
+            r = post_csv(client2, "/payment-revision-batches", late)
+            self.assertEqual(r.status_code, 201, r.text)
+            final = wait_run(client2, run_id)
+            self.assertEqual(final["status"], "completed")
+            self.assertEqual(final["done_samples"], total)
+            rows = [r for r in dataset_rows(client2, run_id)
+                    if r["sample_id"].startswith("rr-")]
+            self.assertEqual(len(rows), 4000)
+            # resumed with the ORIGINAL scope: uniform old amount everywhere
+            self.assertEqual({r["amount_last_24h_cents"] for r in rows}, {"7"})
+            # a new run picks the correction up
+            run2 = client2.post("/training-runs").json()
+            final2 = wait_run(client2, run2["run_id"])
+            self.assertEqual(final2["status"], "completed")
+            rows2 = [r for r in dataset_rows(client2, run2["run_id"])
+                     if r["sample_id"].startswith("rr-")]
+            self.assertEqual({r["amount_last_24h_cents"] for r in rows2}, {"77"})
+
 
 if __name__ == "__main__":
     unittest.main()

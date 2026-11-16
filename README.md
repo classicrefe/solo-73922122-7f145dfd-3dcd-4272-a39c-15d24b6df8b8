@@ -1,16 +1,18 @@
 # Point-in-time Payment Feature Builder
 
-风控训练数据服务：按**预测当时可知**的信息重建"近 24 小时支付额"特征，避免迟到更正把未来泄漏进训练集。
+风控训练数据服务：按**预测当时可知**的信息重建"近 24 小时支付额"特征，避免迟到更正把未来泄漏进训练集；每次训练运行在**受理时点**冻结其支付修订范围，运行中途的补传与重启续算都不会改变本次运行的口径。
 
 技术栈：FastAPI + PostgreSQL（psycopg3）+ Docker Compose。交互式 API 文档见服务启动后的 **`/docs`**（Swagger UI）。
 
 ## 特征语义（核心规则）
 
-对每个样本 `(account_id, prediction_at_utc)`：
+对每个样本 `(account_id, prediction_at_utc)`，在**所属运行冻结的修订范围**内：
 
 1. **取预测时已可见的每笔最高修订**：在 `visible_at_utc <= prediction_at_utc`（含等于）的所有修订中，按 `payment_id` 取 `revision_id` 最大者。更正可以改账户、发生时刻、金额——一律以最高可见修订为准。
 2. **撤销不恢复旧修订**：若最高可见修订 `revoked=true`，该支付**完全不计入**，不会回退到更早的修订。
 3. **窗口求和**：按（更正后的）账户匹配，（更正后的）发生时刻落在 `[prediction_at_utc - 24h, prediction_at_utc)`（左闭右开）区间内的支付，对其 `amount_cents` 求和，同时给出支付笔数。
+
+**运行的修订范围**：每次运行在创建时冻结 `revision_watermark_batch`（当时已提交的最大修订批次号）；特征计算只考虑 `batch_id <= revision_watermark_batch` 的修订行。运行创建后才提交的批次——包括 `visible_at` 回填到预测时刻之前的更正——**不会影响本次运行的任何样本**，无论样本在补传前还是补传后计算，也无论是否经历重启；它们由后续运行纳入。因此同一运行内相同 `(account_id, prediction_at_utc)` 的样本必然得到相同金额。
 
 输出列：`sample_id, account_id, prediction_at_utc, amount_last_24h_cents, payment_count`。
 
@@ -62,12 +64,14 @@ s1,acct-A,2026-11-15T12:00:00Z
 
 ## 训练集生成语义
 
-- `POST /training-runs` 在**受理时点**冻结水位线：仅包含此前已提交的完整样本批次。运行期间上传的批次照常受理（201），但属于**下一次**运行。
-- 同一时刻只允许一个活动运行（pending/running），否则 409。
+- `POST /training-runs` 在**受理时点**冻结两条水位线（响应中可见）：
+  - `watermark_seq`：仅包含此前已提交的完整**样本**批次；
+  - `revision_watermark_batch`：仅使用此前已提交的完整**支付修订**批次（`batch_id <= revision_watermark_batch`）。
+- 运行期间上传的批次（样本或修订）照常受理（201）——**补传不必等训练结束**——但都属于**后续**运行。同一时刻只允许一个活动运行（pending/running），否则 409。
 - 每个样本在**独立的短事务**中计算并持久化（`run_results` 幂等写入）：
-  - **不持有长期数据库快照**，也**不为任务复制全部源历史**；as-of 重建完全依靠 `visible_at_utc <= prediction_at_utc` 时间谓词在live表上完成。
-  - 服务重启（含 `docker compose restart` 或异常崩溃）后，从**已完成样本之后**接续；已完成样本不重算，后来提交的批次不混入。
-- `GET /training-runs/{id}/dataset.csv` 仅在运行 **completed** 后提供（此前 409）——即全部样本的金额及其所用支付修订齐备后才可下载。已完成的运行结果不可变。
+  - **不持有长期数据库快照**，也**不为任务复制全部源历史**；as-of 重建依靠 `visible_at_utc <= prediction_at_utc` 时间谓词加 `batch_id <= revision_watermark_batch` 范围谓词在 live 表上完成，冻结的范围只是运行行上的一个整数。
+  - 服务重启（含 `docker compose restart` 或异常崩溃）后，运行从**已完成样本之后**接续，并沿用**创建时冻结的同两条水位线**：已完成样本不重算，后来提交的批次（含回填过去可见的更正）不混入。
+- `GET /training-runs/{id}/dataset.csv` 仅在运行 **completed** 后提供（此前 409）——即全部样本的金额及其所用支付修订齐备后才可下载。已完成的运行结果不可变；后来的更正只影响新运行。
 
 ## API 一览
 
@@ -75,7 +79,7 @@ s1,acct-A,2026-11-15T12:00:00Z
 |---|---|---|
 | POST | `/payment-revision-batches` | 导入支付修订 CSV（201 / 400 格式错 / 409 内容冲突） |
 | POST | `/sample-batches` | 导入预测样本 CSV（同上） |
-| POST | `/training-runs` | 创建训练运行（201 / 409 已有活动运行） |
+| POST | `/training-runs` | 创建训练运行，冻结样本与修订两条水位线（201 / 409 已有活动运行） |
 | GET | `/training-runs` / `/training-runs/{id}` | 运行状态与进度 |
 | GET | `/training-runs/{id}/dataset.csv` | 下载特征数据集（完成前 409） |
 | GET | `/sample-batches`、`/payment-revision-batches` | 批次审计列表 |
@@ -107,6 +111,8 @@ TEST_ADMIN_URL=postgresql://app@127.0.0.1:5544/postgres \
 ## 设计说明与限制
 
 - **单副本**：worker 在应用进程内（单实例）。多副本部署需要为 worker 加选主，未实现。
-- **结果固化**：样本在某次运行中计算后即固化；运行中途到达的"回填过去可见时间"的修订只影响尚未计算的样本（这是"不持快照"设计的固有取舍）。如需重算，用新 `sample_id` 提交样本并创建新运行。
+- **修订范围按批次冻结**：运行的修订口径是"创建时已提交的最大批次号"，以批次为粒度（完整批次要么全在范围内、要么全不在）。修订导入与运行创建共用同一把咨询锁，保证水位线是精确的受理时刻；这也意味着大型 CSV 导入期间，运行创建会短暂排队。
+- **结果固化**：样本在某次运行中计算后即固化；运行后来到达的修订（含回填过去可见时间的批次）只影响之后创建的运行。如需用新更正重算历史样本，创建新运行即可（样本范围同样是累积到受理时点为止）。
+- **升级**：对修复前已存在的数据库，启动时自动执行幂等迁移——为 `payment_revisions` 补 `batch_id`（历史行归入一个合成"遗留批次"，对所有后续运行保持可见）、为 `training_runs` 补 `revision_watermark_batch`（历史运行回填为当前最大批次号）。迁移期间处于 pending/running 的旧运行，其已算样本口径与续算口径可能不一致（它们诞生于修复前）；如需严格一致请重新创建运行。
 - **规模**：每样本一次 as-of 查询（`visible_at` 索引 + 主键）；百万级修订、十万级样本量级可正常工作。更大规模可考虑分区与物化中间层，未实现。
 - 上传解析为整文件内存处理（64MB 上限内）。

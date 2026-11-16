@@ -1,0 +1,2 @@
+payment_id,revision_id,account_id,occurred_at_utc,visible_at_utc,amount_cents,revoked
+ex3-p1,2,acct-EX3,2026-11-15T11:00:00Z,2026-11-15T11:30:00Z,77,false

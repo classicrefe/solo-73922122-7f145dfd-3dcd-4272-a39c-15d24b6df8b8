@@ -1,11 +1,18 @@
 """Point-in-time feature reconstruction.
 
 For one sample (account_id, prediction_at) we rebuild exactly what was
-knowable at prediction time:
+knowable at prediction time *within the run's frozen revision scope*:
 
-* among all revisions of a payment with ``visible_at <= prediction_at``
-  take the one with the highest revision_id (later corrections supersede
-  earlier ones and may change account, occurred time and amount);
+* the run sees only revision batches committed before the run was
+  created: rows with ``batch_id <= revision_watermark_batch``. Batches
+  uploaded while the run is in progress — even ones backdated to be
+  visible at prediction time — belong to later runs, so every sample in
+  a run is computed against the same revision scope, before and after a
+  restart;
+* among the in-scope revisions of a payment with ``visible_at <=
+  prediction_at`` take the one with the highest revision_id (later
+  corrections supersede earlier ones and may change account, occurred
+  time and amount);
 * if that top revision is revoked the payment contributes nothing —
   revocation does NOT resurrect older revisions;
 * the payment counts towards the feature when its (corrected) account
@@ -14,7 +21,8 @@ knowable at prediction time:
 
 The query runs in a short read transaction against the live table. No
 database snapshot is held across samples and no private copy of the
-revision history is materialized for a run.
+revision history is materialized for a run — the frozen scope is one
+integer compared against the ``batch_id`` column.
 """
 
 from __future__ import annotations
@@ -29,6 +37,7 @@ WITH top_rev AS (
            payment_id, account_id, occurred_at, amount_cents, revoked
     FROM payment_revisions
     WHERE visible_at <= %(pred)s
+      AND batch_id <= %(rev_watermark)s
     ORDER BY payment_id, revision_id DESC
 )
 SELECT COALESCE(SUM(amount_cents), 0)::bigint AS amount_cents,
@@ -42,10 +51,18 @@ WHERE NOT revoked
 
 
 def compute_feature(
-    conn: Connection, account_id: str, prediction_at: datetime
+    conn: Connection,
+    account_id: str,
+    prediction_at: datetime,
+    revision_watermark: int,
 ) -> tuple[int, int]:
-    """Return (amount_last_24h_cents, payment_count) for one sample."""
+    """Return (amount_last_24h_cents, payment_count) for one sample.
+
+    ``revision_watermark`` is the run's frozen scope: only revisions from
+    batches with ``batch_id <= revision_watermark`` are considered.
+    """
     row = conn.execute(
-        FEATURE_SQL, {"acc": account_id, "pred": prediction_at}
+        FEATURE_SQL,
+        {"acc": account_id, "pred": prediction_at, "rev_watermark": revision_watermark},
     ).fetchone()
     return int(row[0]), int(row[1])

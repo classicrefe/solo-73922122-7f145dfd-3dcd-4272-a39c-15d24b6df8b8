@@ -4,11 +4,19 @@ Semantics:
 * A run covers exactly the samples with ``seq <= watermark_seq`` frozen at
   run-creation time. Batches uploaded while the run is in progress are
   accepted but belong to the NEXT run.
+* A run reads exactly the payment revisions with ``batch_id <=
+  revision_watermark_batch``, also frozen at run-creation time. Revision
+  batches uploaded mid-run — including backdated ones that would have
+  been visible at prediction time — do not change any sample of the
+  in-flight run; they are picked up by the NEXT run. Two samples with the
+  same (account_id, prediction_at) therefore always get the same amounts
+  within one run.
 * Progress is persisted per sample in ``run_results`` (INSERT ... ON
   CONFLICT DO NOTHING), so a crash/restart loses at most the in-flight
   sample. On startup a stale 'running' run is moved back to 'pending' and
-  resumes from the first sample without a stored result — completed
-  samples are never recomputed and later-submitted batches never leak in.
+  resumes from the first sample without a stored result, with the SAME
+  frozen watermarks — completed samples are never recomputed and
+  later-submitted batches never leak in.
 * Each sample is computed in its own short transaction; no snapshot is
   held across samples.
 """
@@ -75,9 +83,9 @@ class RunWorker(threading.Thread):
             if claimed is None:
                 self.stop_event.wait(self.idle_sleep_s)
                 continue
-            run_id, watermark_seq = claimed
+            run_id, watermark_seq, revision_watermark = claimed
             try:
-                self._process(run_id, watermark_seq)
+                self._process(run_id, watermark_seq, revision_watermark)
             except Exception:
                 log.exception("run %s failed", run_id)
                 try:
@@ -99,7 +107,7 @@ class RunWorker(threading.Thread):
         if n:
             log.info("re-queued %s run(s) interrupted by shutdown", n)
 
-    def _claim_next(self) -> tuple[int, int] | None:
+    def _claim_next(self) -> tuple[int, int, int] | None:
         with self.pool.connection() as conn:
             row = conn.execute(
                 """
@@ -112,13 +120,20 @@ class RunWorker(threading.Thread):
                     ORDER BY run_id
                     LIMIT 1
                 )
-                RETURNING run_id, watermark_seq
+                RETURNING run_id, watermark_seq, revision_watermark_batch
                 """
             ).fetchone()
-        return (row[0], row[1]) if row else None
+        return (row[0], row[1], row[2]) if row else None
 
-    def _process(self, run_id: int, watermark_seq: int) -> None:
-        log.info("run %s: processing samples up to seq %s", run_id, watermark_seq)
+    def _process(
+        self, run_id: int, watermark_seq: int, revision_watermark: int
+    ) -> None:
+        log.info(
+            "run %s: samples up to seq %s, revision batches up to %s",
+            run_id,
+            watermark_seq,
+            revision_watermark,
+        )
         while not self.stop_event.is_set():
             with self.pool.connection() as conn:
                 rows = conn.execute(
@@ -132,7 +147,9 @@ class RunWorker(threading.Thread):
                     break
                 # One short transaction per sample: compute + persist.
                 with self.pool.connection() as conn:
-                    amount, count = compute_feature(conn, account_id, prediction_at)
+                    amount, count = compute_feature(
+                        conn, account_id, prediction_at, revision_watermark
+                    )
                     conn.execute(
                         _INSERT_RESULT_SQL,
                         {

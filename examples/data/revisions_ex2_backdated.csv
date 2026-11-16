@@ -1,0 +1,3 @@
+payment_id,revision_id,account_id,occurred_at_utc,visible_at_utc,amount_cents,revoked
+ex2-p1,2,acct-EX2,2026-11-15T11:00:00Z,2026-11-15T11:30:00Z,250,false
+ex2-p2,1,acct-EX2,2026-11-15T11:00:00Z,2026-11-15T11:00:00Z,5,false
